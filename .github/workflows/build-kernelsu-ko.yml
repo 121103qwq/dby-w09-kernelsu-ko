@@ -127,7 +127,8 @@ jobs:
           test -f output/modules_build/include/generated/utsrelease.h
           grep -Fx '#define UTS_RELEASE "4.19.157-perf+"' output/modules_build/include/generated/utsrelease.h
           # modules_prepare does not generate this SELinux header. KernelSU includes it.
-          python3 dby-w09-4.0/scripts/selinux/mdp/mdp \
+          make -C dby-w09-4.0/scripts/selinux/mdp mdp
+          ./dby-w09-4.0/scripts/selinux/mdp/mdp \
             dby-w09-4.0/security/selinux/include/classmap.h \
             -f /tmp/selinux-flask.h /tmp/selinux-av_permissions.h
           cp -f /tmp/selinux-av_permissions.h dby-w09-4.0/security/selinux/av_permissions.h
