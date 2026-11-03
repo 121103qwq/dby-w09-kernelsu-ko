@@ -1,0 +1,191 @@
+name: Build DBY-W09 KernelSU v0.9.5 KO
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kernelsu-ko:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout workflow only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            python3 git make bc flex bison libssl-dev libelf-dev kmod
+
+      - name: Shallow clone Huawei kernel source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/yunsmall/dby-w09-4.0.git dby-w09-4.0
+          test -f dby-w09-4.0/Makefile
+
+      - name: Clone and stage only DBY-W09 kernel hack tooling
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/yunsmall/DBY-W09_kernel_hack.git hack
+          cp -a hack/tools hack/analysis hack/env.sh .
+          test -f tools/setup_kernel_source.py
+          test -s analysis/my_config
+
+      - name: Apply mandatory Huawei kernel source fixes
+        run: |
+          set -euo pipefail
+          python3 tools/setup_kernel_source.py
+
+      - name: Clone pinned KernelSU v0.9.5 and wire Kbuild
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v0.9.5 https://github.com/tiann/KernelSU.git KernelSU
+          test "$(git -C KernelSU describe --tags --exact-match)" = 'v0.9.5'
+          ln -sfn ../../KernelSU/kernel dby-w09-4.0/drivers/kernelsu
+          test -f dby-w09-4.0/drivers/kernelsu/Kconfig
+          test -f dby-w09-4.0/drivers/kernelsu/Makefile
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('dby-w09-4.0/drivers/Makefile')
+          line='obj-$(CONFIG_KSU) += kernelsu/'
+          s=p.read_text()
+          if s.splitlines().count(line) == 0:
+              s=s.rstrip('\n')+'\n'+line+'\n'
+              p.write_text(s)
+          assert p.read_text().splitlines().count(line) == 1, 'drivers/Makefile must have exactly one KSU entry'
+
+          p=Path('dby-w09-4.0/drivers/Kconfig')
+          line='source "drivers/kernelsu/Kconfig"'
+          s=p.read_text()
+          if s.splitlines().count(line) == 0:
+              lines=s.splitlines(keepends=True)
+              idx=[i for i,v in enumerate(lines) if v.strip() == 'endmenu']
+              assert idx, 'No endmenu found in drivers/Kconfig'
+              lines.insert(idx[-1],line+'\n')
+              p.write_text(''.join(lines))
+          assert p.read_text().splitlines().count(line) == 1, 'drivers/Kconfig must have exactly one KSU entry'
+          assert p.read_text().rfind(line)<p.read_text().rfind('endmenu'), 'KSU source must be inside drivers menu'
+          PY
+
+      - name: Prepare only KernelSU module config
+        run: |
+          set -euo pipefail
+          mkdir -p output/modules_build
+          cp analysis/my_config output/modules_build/.config
+          scripts_config=dby-w09-4.0/scripts/config
+          test -x "$scripts_config"
+          "$scripts_config" --file output/modules_build/.config \
+            --disable MODULE_SIG_ALL \
+            --enable MODULES \
+            --enable MODULE_UNLOAD \
+            --enable MODVERSIONS \
+            --enable OVERLAY_FS \
+            --enable KSU \
+            --module KSU \
+            --enable KSU_DEBUG
+          if ! grep -qx 'CONFIG_KSU=m' output/modules_build/.config; then
+            printf '\nCONFIG_KSU=m\nCONFIG_KSU_DEBUG=y\nCONFIG_OVERLAY_FS=y\n' >> output/modules_build/.config
+          fi
+          grep -qx 'CONFIG_KSU=m' output/modules_build/.config
+
+      - name: Configure and prepare headers (no full kernel)
+        run: |
+          set -euo pipefail
+          export ARCH=arm64
+          export LLVM=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export HOSTCC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export HOSTCFLAGS=-fcommon
+          export KCFLAGS='-Wno-error -fno-builtin-wcslen'
+          # LOCALVERSION suppresses git-dirty automatic suffixes and pins + once.
+          export LOCALVERSION=+
+          make -C dby-w09-4.0 O=../output/modules_build olddefconfig
+          if ! grep -qx 'CONFIG_KSU=m' output/modules_build/.config; then
+            echo 'CONFIG_KSU=m was dropped by olddefconfig; retrying once'
+            dby-w09-4.0/scripts/config --file output/modules_build/.config --module KSU
+            make -C dby-w09-4.0 O=../output/modules_build olddefconfig
+          fi
+          grep -qx 'CONFIG_KSU=m' output/modules_build/.config || {
+            echo 'ERROR: CONFIG_KSU=m is not valid for this kernel tree'; exit 1;
+          }
+          grep -qx 'CONFIG_MODVERSIONS=y' output/modules_build/.config
+          make -C dby-w09-4.0 O=../output/modules_build modules_prepare -j"$(nproc)"
+          test -f output/modules_build/include/generated/utsrelease.h
+          grep -Fx '#define UTS_RELEASE "4.19.157-perf+"' output/modules_build/include/generated/utsrelease.h
+          if [ ! -s output/modules_build/Module.symvers ]; then
+            echo 'WARNING: Module.symvers is unavailable. modules_prepare does not generate kernel export symbol CRCs.'
+            echo 'The KO may compile and report the requested vermagic but still be unloadable due to CONFIG_MODVERSIONS=y.'
+          fi
+
+      - name: Show disk usage and stop above 12 GiB workspace
+        run: |
+          set -euo pipefail
+          df -h
+          used_bytes=$(du -sb "$GITHUB_WORKSPACE" | awk '{print $1}')
+          printf 'Workspace disk usage: %s bytes\n' "$used_bytes"
+          if (( used_bytes > 12 * 1024 * 1024 * 1024 )); then
+            echo 'ERROR: CI workspace exceeded 12 GiB'; exit 1
+          fi
+
+      - name: Build only drivers/kernelsu as KO
+        run: |
+          set -euo pipefail
+          export ARCH=arm64
+          export LLVM=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export HOSTCC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export HOSTCFLAGS=-fcommon
+          export KCFLAGS='-Wno-error -fno-builtin-wcslen'
+          export LOCALVERSION=+
+          make -C dby-w09-4.0 O=../output/modules_build M=drivers/kernelsu modules -j"$(nproc)"
+
+      - name: Validate KO and stage exactly one artifact file
+        run: |
+          set -euo pipefail
+          df -h
+          used_bytes=$(du -sb "$GITHUB_WORKSPACE" | awk '{print $1}')
+          if (( used_bytes > 12 * 1024 * 1024 * 1024 )); then
+            echo 'ERROR: CI workspace exceeded 12 GiB'; exit 1
+          fi
+          # M= may place objects under the kernel source or its output tree.
+          mapfile -d '' candidates < <(find output/modules_build KernelSU/kernel -type f -name 'kernelsu.ko' -print0)
+          if [ "${#candidates[@]}" -ne 1 ]; then
+            printf 'ERROR: expected exactly one kernelsu.ko, found %d\n' "${#candidates[@]}"
+            exit 1
+          fi
+          ko="${candidates[0]}"
+          file "$ko"
+          modinfo "$ko"
+          test "$(modinfo -F name "$ko")" = 'kernelsu'
+          vermagic="$(modinfo -F vermagic "$ko")"
+          depends="$(modinfo -F depends "$ko")"
+          printf 'vermagic: %s\ndepends: %s\n' "$vermagic" "$depends"
+          expected='4.19.157-perf+ SMP preempt mod_unload modversions aarch64'
+          [[ "$vermagic" == *"$expected"* ]] || {
+            printf 'ERROR: vermagic mismatch; expected substring: %s\n' "$expected"
+            exit 1
+          }
+          mkdir -p dist
+          cp -- "$ko" dist/kernelsu.ko
+          test "$(find dist -type f | wc -l)" -eq 1
+          sha256sum dist/kernelsu.ko
+
+      - name: Upload kernelsu.ko only
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-ko
+          path: dist/kernelsu.ko
+          retention-days: 1
+          if-no-files-found: error
