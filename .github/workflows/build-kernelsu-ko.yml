@@ -120,6 +120,9 @@ jobs:
             echo 'ERROR: CONFIG_KSU=m is not valid for this kernel tree'; exit 1;
           }
           grep -qx 'CONFIG_MODVERSIONS=y' output/modules_build/.config
+          # CRCs recovered from the Aug 30 factory image, not generated here.
+          test -s "$GITHUB_WORKSPACE/Module.symvers"
+          cp -f "$GITHUB_WORKSPACE/Module.symvers" output/modules_build/Module.symvers
           make -C dby-w09-4.0 O=../output/modules_build modules_prepare -j"$(nproc)"
           test -f output/modules_build/include/generated/utsrelease.h
           grep -Fx '#define UTS_RELEASE "4.19.157-perf+"' output/modules_build/include/generated/utsrelease.h
@@ -129,10 +132,8 @@ jobs:
           test -n "$found"
           cp -f "$found" dby-w09-4.0/security/selinux/av_permissions.h
           cp -f "$found" dby-w09-4.0/security/selinux/include/av_permissions.h
-          if [ ! -s output/modules_build/Module.symvers ]; then
-            echo 'WARNING: Module.symvers is unavailable. modules_prepare does not generate kernel export symbol CRCs.'
-            echo 'The KO may compile and report the requested vermagic but still be unloadable due to CONFIG_MODVERSIONS=y.'
-          fi
+          cp -f "$GITHUB_WORKSPACE/Module.symvers" output/modules_build/Module.symvers
+          test "$(wc -l < output/modules_build/Module.symvers)" -gt 10000
 
       - name: Show disk usage and stop above 12 GiB workspace
         run: |
