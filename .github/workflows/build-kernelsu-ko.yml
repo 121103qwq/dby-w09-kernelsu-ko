@@ -126,9 +126,10 @@ jobs:
           make -C dby-w09-4.0 O=../output/modules_build modules_prepare -j"$(nproc)"
           test -f output/modules_build/include/generated/utsrelease.h
           grep -Fx '#define UTS_RELEASE "4.19.157-perf+"' output/modules_build/include/generated/utsrelease.h
-          # modules_prepare does not generate this SELinux header. KernelSU includes it.
-          make -C dby-w09-4.0/scripts/selinux/mdp mdp
-          ./dby-w09-4.0/scripts/selinux/mdp/mdp \
+          # modules_prepare builds this helper but does not run it. Its include path
+          # only works from the kernel build, so reuse that binary.
+          test -x output/modules_build/scripts/selinux/mdp/mdp
+          ./output/modules_build/scripts/selinux/mdp/mdp \
             dby-w09-4.0/security/selinux/include/classmap.h \
             -f /tmp/selinux-flask.h /tmp/selinux-av_permissions.h
           cp -f /tmp/selinux-av_permissions.h dby-w09-4.0/security/selinux/av_permissions.h
